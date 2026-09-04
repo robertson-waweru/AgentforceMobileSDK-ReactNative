@@ -27,6 +27,26 @@ struct BridgeNetwork: SalesforceNetwork.Network {
     func data(for request: SalesforceNetwork.NetworkRequest) async throws -> (Data, URLResponse) {
         let restRequest = try createRestRequest(from: request)
 
+        // The Mobile SDK's SFRestAPI presents an interactive OAuth login web view whenever the
+        // current user has NEITHER an access token NOR a refresh token (SFRestAPI.m: "No auth
+        // credentials found. Authenticating before sending request"). It does so on whatever
+        // thread the request runs on — for Agentforce traffic that is a background queue, which
+        // also violates UIKit main-thread rules — and yanks the user to a login screen
+        // mid-session (e.g. right after "clear chat") instead of letting the host app run its
+        // own OAuth flow. When there is nothing left to refresh with, fail fast with a clean
+        // auth error so the SDK surfaces a recoverable state and the host controls
+        // re-authentication. When a refresh token still exists, let the request proceed so
+        // SFRestAPI can refresh the access token silently on a 401.
+        // See [[project_rn_ios_auth_login_fix]].
+        if restRequest.requiresAuthentication {
+            let credentials = UserAccountManager.shared.currentUserAccount?.credentials
+            let hasAccessToken = !(credentials?.accessToken?.isEmpty ?? true)
+            let hasRefreshToken = !(credentials?.refreshToken?.isEmpty ?? true)
+            if !hasAccessToken && !hasRefreshToken {
+                throw NetworkError.authenticationRequired
+            }
+        }
+
         return try await withCheckedThrowingContinuation { continuation in
             restClient.send(request: restRequest) { result in
                 switch result {
@@ -89,9 +109,19 @@ struct BridgeNetwork: SalesforceNetwork.Network {
             restRequest.endpoint = ""
         }
 
-        // Copy headers
+        // Copy headers, but drop the caller's Authorization header on authenticated requests.
+        // The Mobile SDK RestClient injects and — crucially — REFRESHES its own OAuth bearer
+        // token. SFRestRequest.prepareRequestForSend applies our customHeaders AFTER setting the
+        // Mobile SDK bearer, so a token copied here overrides the Mobile SDK's managed token on
+        // every send and every 401-refresh replay, defeating silent token refresh for Agentforce
+        // traffic (and pinning a stale/expired token that then fails). Let the Mobile SDK own the
+        // Authorization header instead. See [[project_rn_ios_auth_login_fix]].
         if let headerFields = request.baseRequest.allHTTPHeaderFields {
             for (key, value) in headerFields {
+                if restRequest.requiresAuthentication,
+                   key.caseInsensitiveCompare("Authorization") == .orderedSame {
+                    continue
+                }
                 restRequest.setHeaderValue(value, forHeaderName: key)
             }
         }
@@ -119,6 +149,9 @@ private extension URLRequest {
 enum NetworkError: Error {
     case noData
     case invalidURL
+    /// The Mobile SDK has no usable session (no access token and no refresh token). Surfaced
+    /// instead of letting SFRestAPI trigger an interactive login so the host app controls auth.
+    case authenticationRequired
 }
 
 #endif // canImport(SalesforceSDKCore)
